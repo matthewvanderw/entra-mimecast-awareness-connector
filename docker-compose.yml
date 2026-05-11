@@ -1,0 +1,31 @@
+services:
+  connector:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Schedule — standard 5-field cron expression (minute hour day month weekday).
+      # Default: midnight daily.
+      CRON_EXPRESSION: ${CRON_EXPRESSION:-0 0 * * *}
+
+      # Microsoft Entra ID (Azure AD) — App Registration with
+      # User.Read.All and User.ReadWrite.All Graph API permissions (admin-consented).
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID}
+      ENTRA_CLIENT_ID: ${ENTRA_CLIENT_ID}
+      ENTRA_CLIENT_SECRET: ${ENTRA_CLIENT_SECRET}
+
+      # Mimecast Awareness Training — 2.0 API OAuth client credentials from
+      # Services > API and Platform Integrations.
+      # Override MIMECAST_BASE_URL for US/EU/DE regional endpoints.
+      MIMECAST_BASE_URL: ${MIMECAST_BASE_URL:-https://api.services.mimecast.com}
+      MIMECAST_CLIENT_ID: ${MIMECAST_CLIENT_ID}
+      MIMECAST_CLIENT_SECRET: ${MIMECAST_CLIENT_SECRET}
+
+      # Tuning (optional)
+      PAGE_SIZE: ${PAGE_SIZE:-50}
+      DISABLE_THRESHOLD: ${DISABLE_THRESHOLD:-4}
+
+      # Set to "true" to log which accounts would be disabled without making
+      # any changes.  Recommended for validating the first deployment.
+      DRY_RUN: ${DRY_RUN:-true}
+    env_file:
+      - .env
