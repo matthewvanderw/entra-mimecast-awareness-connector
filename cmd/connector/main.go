@@ -4,14 +4,11 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/matthewvanderw/entra-mimecast-awareness-connector/internal/config"
 	"github.com/matthewvanderw/entra-mimecast-awareness-connector/internal/connector"
 	"github.com/matthewvanderw/entra-mimecast-awareness-connector/internal/entra"
 	"github.com/matthewvanderw/entra-mimecast-awareness-connector/internal/mimecast"
-	"github.com/robfig/cron/v3"
 )
 
 func main() {
@@ -31,25 +28,10 @@ func main() {
 	)
 	conn := connector.New(entraClient, mimecastClient, cfg.PageSize, cfg.DisableThreshold, cfg.DryRun)
 
-	c := cron.New()
-	if _, err := c.AddFunc(cfg.CronExpression, func() {
-		if err := conn.Run(context.Background()); err != nil {
-			slog.Error("compliance run failed", "error", err)
-		}
-	}); err != nil {
-		slog.Error("invalid cron expression", "expression", cfg.CronExpression, "error", err)
+	slog.Info("starting compliance run", "dry_run", cfg.DryRun)
+	if err := conn.Run(context.Background()); err != nil {
+		slog.Error("compliance run failed", "error", err)
 		os.Exit(1)
 	}
-
-	c.Start()
-	slog.Info("connector scheduled", "expression", cfg.CronExpression, "dry_run", cfg.DryRun)
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	slog.Info("shutdown signal received — waiting for in-flight run to complete")
-	stopCtx := c.Stop()
-	<-stopCtx.Done()
-	slog.Info("connector stopped")
+	slog.Info("compliance run complete")
 }

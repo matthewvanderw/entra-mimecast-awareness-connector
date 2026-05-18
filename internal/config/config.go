@@ -7,8 +7,6 @@ import (
 )
 
 type Config struct {
-	CronExpression string
-
 	EntraTenantID     string
 	EntraClientID     string
 	EntraClientSecret string
@@ -32,7 +30,6 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		CronExpression:    getEnv("CRON_EXPRESSION", "0 0 * * *"),
 		EntraTenantID:     getEnv("ENTRA_TENANT_ID", ""),
 		EntraClientID:     getEnv("ENTRA_CLIENT_ID", ""),
 		EntraClientSecret: getEnv("ENTRA_CLIENT_SECRET", ""),
