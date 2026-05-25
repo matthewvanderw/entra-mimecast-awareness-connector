@@ -1,7 +1,7 @@
 services:
   connector:
     build: .
-    restart: unless-stopped
+    restart: on-failure
     environment:
       # Schedule — standard 5-field cron expression (minute hour day month weekday).
       # Default: midnight daily.

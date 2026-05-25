@@ -1,5 +1,17 @@
 package mimecast
 
+// UserRecord is the public representation of a Mimecast user's training status.
+type UserRecord struct {
+	UserID     string // Mimecast userId — may equal the Entra object ID when synced from Azure AD
+	Email      string
+	Name       string
+	UserState  string // Mimecast userState field, e.g. "active", "inactive"
+	Watched    int    // videos watched (correct + incorrect attempts)
+	NotWatched int    // videos not yet watched
+	Total      int    // total assigned videos
+	Incomplete bool   // true when the user is active and below the completion threshold
+}
+
 // performanceRecord is one element of the data array returned by
 // /api/awareness-training/company/get-performance-details.
 type performanceRecord struct {

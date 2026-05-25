@@ -24,9 +24,9 @@ const (
 
 // Client defines the Mimecast Awareness Training operations required by the connector.
 type Client interface {
-	// GetIncompleteUsers returns the email addresses of all active users who
-	// have at least threshold unwatched training videos.
-	GetIncompleteUsers(ctx context.Context, pageSize, threshold int) ([]string, error)
+	// GetAllUserRecords returns training stats for every active Mimecast user.
+	// Incomplete is set when a user has at least threshold unwatched videos.
+	GetAllUserRecords(ctx context.Context, pageSize, threshold int) ([]UserRecord, error)
 }
 
 type client struct {
@@ -51,10 +51,11 @@ func NewClient(baseURL, clientID, clientSecret string) Client {
 	}
 }
 
-// GetIncompleteUsers pages through the company performance report and returns
-// email addresses of active users who have at least one unwatched video.
-func (c *client) GetIncompleteUsers(ctx context.Context, pageSize, threshold int) ([]string, error) {
-	var incomplete []string
+// GetAllUserRecords pages through the company performance report and returns
+// training stats for every active user. Incomplete is set when NumNotWatched
+// is at or above threshold.
+func (c *client) GetAllUserRecords(ctx context.Context, pageSize, threshold int) ([]UserRecord, error) {
+	var out []UserRecord
 	var pageToken string
 
 	for {
@@ -64,9 +65,22 @@ func (c *client) GetIncompleteUsers(ctx context.Context, pageSize, threshold int
 		}
 
 		for _, r := range records {
-			if isIncomplete(r, threshold) && r.Email != "" {
-				incomplete = append(incomplete, r.Email)
+			if r.Email == "" {
+				continue
 			}
+			watched := r.NumCorrect + r.NumIncorrect
+			total := watched + r.NumNotWatched
+			out = append(out, UserRecord{
+				UserID:     r.UserID,
+				Email:      r.Email,
+				Name:       r.Name,
+				UserState:  r.UserState,
+				Watched:    watched,
+				NotWatched: r.NumNotWatched,
+				Total:      total,
+				// Only active users are candidates for disabling.
+				Incomplete: strings.EqualFold(r.UserState, "active") && r.NumNotWatched >= threshold,
+			})
 		}
 
 		if nextToken == "" {
@@ -75,24 +89,21 @@ func (c *client) GetIncompleteUsers(ctx context.Context, pageSize, threshold int
 		pageToken = nextToken
 	}
 
-	return incomplete, nil
+	return out, nil
 }
 
 // fetchPage calls get-performance-details for one page, returning the records
 // and the next-page token (empty string when this is the last page).
 func (c *client) fetchPage(ctx context.Context, pageSize int, pageToken string) ([]performanceRecord, string, error) {
+	meta := requestMeta{Pagination: requestPagination{PageSize: pageSize}}
+	if pageToken != "" {
+		meta.Pagination.PageToken = pageToken
+	}
 	body := requestEnvelope{
+		Meta: &meta,
 		Data: []map[string]any{
 			{"includeUserDetails": true},
 		},
-	}
-	if pageToken != "" {
-		body.Meta = &requestMeta{
-			Pagination: requestPagination{
-				PageSize:  pageSize,
-				PageToken: pageToken,
-			},
-		}
 	}
 
 	payload, err := json.Marshal(body)
@@ -194,8 +205,3 @@ func (c *client) getToken(ctx context.Context) (string, error) {
 	return c.token, nil
 }
 
-// isIncomplete returns true when an active user has at least threshold unwatched
-// training videos.
-func isIncomplete(r performanceRecord, threshold int) bool {
-	return strings.EqualFold(r.UserState, "active") && r.NumNotWatched >= threshold
-}

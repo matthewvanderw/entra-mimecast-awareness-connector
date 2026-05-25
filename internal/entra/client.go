@@ -22,7 +22,8 @@ const (
 // Client defines the Entra ID operations required by the connector.
 type Client interface {
 	ListActiveUsers(ctx context.Context, pageSize int) ([]User, error)
-	DisableUsers(ctx context.Context, userIDs []string) error
+	ListAllUsers(ctx context.Context, pageSize int) ([]User, error)
+	DisableUsers(ctx context.Context, userIDs []string) ([]DisableResult, error)
 }
 
 type client struct {
@@ -91,8 +92,19 @@ func (c *client) getToken(ctx context.Context) (string, error) {
 }
 
 // ListActiveUsers pages through all accountEnabled=true users in the directory.
-// pageSize controls the $top parameter (max 999 per Graph API constraints).
 func (c *client) ListActiveUsers(ctx context.Context, pageSize int) ([]User, error) {
+	return c.listUsers(ctx, pageSize, "accountEnabled eq true")
+}
+
+// ListAllUsers pages through every user in the directory regardless of account
+// state. Used by dry-run mode to surface disabled accounts in the output.
+func (c *client) ListAllUsers(ctx context.Context, pageSize int) ([]User, error) {
+	return c.listUsers(ctx, pageSize, "")
+}
+
+// listUsers is the shared paginator. When filter is non-empty it is applied as
+// a $filter query parameter and ConsistencyLevel/eventual is set accordingly.
+func (c *client) listUsers(ctx context.Context, pageSize int, filter string) ([]User, error) {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -101,9 +113,11 @@ func (c *client) ListActiveUsers(ctx context.Context, pageSize int) ([]User, err
 	var users []User
 	q := url.Values{}
 	q.Set("$top", fmt.Sprintf("%d", pageSize))
-	q.Set("$count", "true")
 	q.Set("$select", "id,displayName,userPrincipalName,mail,accountEnabled")
-	q.Set("$filter", "accountEnabled eq true")
+	if filter != "" {
+		q.Set("$count", "true")
+		q.Set("$filter", filter)
+	}
 	nextURL := fmt.Sprintf("%s/users?%s", graphBase, q.Encode())
 
 	for nextURL != "" {
@@ -112,8 +126,10 @@ func (c *client) ListActiveUsers(ctx context.Context, pageSize int) ([]User, err
 			return nil, fmt.Errorf("building users request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
-		// ConsistencyLevel + $count required when using $filter with advanced queries
-		req.Header.Set("ConsistencyLevel", "eventual")
+		if filter != "" {
+			// ConsistencyLevel + $count required when using $filter with advanced queries.
+			req.Header.Set("ConsistencyLevel", "eventual")
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -142,33 +158,42 @@ func (c *client) ListActiveUsers(ctx context.Context, pageSize int) ([]User, err
 
 // DisableUsers sets accountEnabled=false for each userID using the Graph $batch
 // endpoint (max 20 items per call) to stay within API rate limits.
-func (c *client) DisableUsers(ctx context.Context, userIDs []string) error {
+// Fatal errors (e.g. 401 Unauthorized on the batch endpoint) are returned as the
+// error value. Per-user failures (e.g. 403 for privileged accounts) are recorded
+// in the returned slice so callers can continue processing the remaining users.
+func (c *client) DisableUsers(ctx context.Context, userIDs []string) ([]DisableResult, error) {
 	if len(userIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	token, err := c.getToken(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	var all []DisableResult
 	for i := 0; i < len(userIDs); i += batchMax {
 		end := i + batchMax
 		if end > len(userIDs) {
 			end = len(userIDs)
 		}
-		if err := c.sendDisableBatch(ctx, token, userIDs[i:end]); err != nil {
-			return fmt.Errorf("batch starting at index %d: %w", i, err)
+		results, err := c.sendDisableBatch(ctx, token, userIDs[i:end])
+		if err != nil {
+			return nil, fmt.Errorf("batch starting at index %d: %w", i, err)
 		}
+		all = append(all, results...)
 	}
-	return nil
+	return all, nil
 }
 
-func (c *client) sendDisableBatch(ctx context.Context, token string, userIDs []string) error {
+func (c *client) sendDisableBatch(ctx context.Context, token string, userIDs []string) ([]DisableResult, error) {
+	idToUser := make(map[string]string, len(userIDs))
 	items := make([]batchRequest, len(userIDs))
 	for i, uid := range userIDs {
+		itemID := fmt.Sprintf("%d", i+1)
+		idToUser[itemID] = uid
 		items[i] = batchRequest{
-			ID:     fmt.Sprintf("%d", i+1),
+			ID:     itemID,
 			Method: "PATCH",
 			URL:    fmt.Sprintf("/users/%s", uid),
 			Headers: map[string]string{
@@ -180,41 +205,49 @@ func (c *client) sendDisableBatch(ctx context.Context, token string, userIDs []s
 
 	payload, err := json.Marshal(batchEnvelope{Requests: items})
 	if err != nil {
-		return fmt.Errorf("marshalling batch: %w", err)
+		return nil, fmt.Errorf("marshalling batch: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, graphBase+"/$batch", bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("building batch request: %w", err)
+		return nil, fmt.Errorf("building batch request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("sending batch: %w", err)
+		return nil, fmt.Errorf("sending batch: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("batch endpoint %d: %s", resp.StatusCode, body)
+		// 401 means our credentials are invalid — nothing further will succeed.
+		// Any other HTTP-level failure from the batch endpoint is also fatal.
+		return nil, fmt.Errorf("batch endpoint %d: %s", resp.StatusCode, body)
 	}
 
 	var br batchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&br); err != nil {
-		return fmt.Errorf("decoding batch response: %w", err)
+		return nil, fmt.Errorf("decoding batch response: %w", err)
 	}
 
-	var failures []string
+	results := make([]DisableResult, 0, len(userIDs))
 	for _, r := range br.Responses {
-		// Graph returns 204 No Content for a successful PATCH
-		if r.Status != http.StatusNoContent {
-			failures = append(failures, fmt.Sprintf("id=%s status=%d", r.ID, r.Status))
+		uid := idToUser[r.ID]
+		if r.Status == http.StatusNoContent {
+			results = append(results, DisableResult{UserID: uid})
+			continue
 		}
+		// 403 Forbidden: account has elevated privileges the app cannot override.
+		// 404 Not Found: account was removed between the list and disable steps.
+		// Any other unexpected status: record and skip rather than aborting the run.
+		results = append(results, DisableResult{
+			UserID:  uid,
+			Skipped: true,
+			Err:     fmt.Errorf("Graph status %d: %s", r.Status, r.Body),
+		})
 	}
-	if len(failures) > 0 {
-		return fmt.Errorf("batch had %d failure(s): %s", len(failures), strings.Join(failures, "; "))
-	}
-	return nil
+	return results, nil
 }

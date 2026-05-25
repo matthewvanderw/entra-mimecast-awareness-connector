@@ -1,5 +1,14 @@
 package entra
 
+import "encoding/json"
+
+// DisableResult is the outcome of one account-disable attempt.
+type DisableResult struct {
+	UserID  string
+	Skipped bool  // true when Graph denied the operation (e.g. privileged account)
+	Err     error // non-nil for skipped or otherwise failed entries
+}
+
 // User represents a Microsoft Entra ID (Azure AD) user from the Graph API.
 type User struct {
 	ID                string `json:"id"`
@@ -37,6 +46,7 @@ type batchResponse struct {
 }
 
 type batchResponseItem struct {
-	ID     string `json:"id"`
-	Status int    `json:"status"`
+	ID     string          `json:"id"`
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body,omitempty"`
 }
