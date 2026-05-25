@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,8 +22,12 @@ const (
 
 // Client defines the Entra ID operations required by the connector.
 type Client interface {
-	ListActiveUsers(ctx context.Context, pageSize int) ([]User, error)
-	ListAllUsers(ctx context.Context, pageSize int) ([]User, error)
+	// GetUsersByEmail resolves Entra accounts for a list of email addresses.
+	// Each address is matched against both the mail and userPrincipalName fields.
+	// The returned map is keyed by the lowercase input email. Addresses that match
+	// zero accounts are omitted; addresses that match more than one account are
+	// logged as ambiguous and omitted.
+	GetUsersByEmail(ctx context.Context, emails []string) (map[string]User, error)
 	DisableUsers(ctx context.Context, userIDs []string) ([]DisableResult, error)
 }
 
@@ -91,69 +96,121 @@ func (c *client) getToken(ctx context.Context) (string, error) {
 	return c.token, nil
 }
 
-// ListActiveUsers pages through all accountEnabled=true users in the directory.
-func (c *client) ListActiveUsers(ctx context.Context, pageSize int) ([]User, error) {
-	return c.listUsers(ctx, pageSize, "accountEnabled eq true")
-}
+// GetUsersByEmail resolves Entra accounts for a list of email addresses using
+// the Graph $batch API (up to 20 lookups per call). Each address is matched
+// against both the mail and userPrincipalName fields. The returned map is keyed
+// by the lowercase input email. Zero-match addresses are omitted silently;
+// addresses matching more than one account are logged as ambiguous and omitted.
+func (c *client) GetUsersByEmail(ctx context.Context, emails []string) (map[string]User, error) {
+	if len(emails) == 0 {
+		return map[string]User{}, nil
+	}
 
-// ListAllUsers pages through every user in the directory regardless of account
-// state. Used by dry-run mode to surface disabled accounts in the output.
-func (c *client) ListAllUsers(ctx context.Context, pageSize int) ([]User, error) {
-	return c.listUsers(ctx, pageSize, "")
-}
+	// Deduplicate while preserving order.
+	seen := make(map[string]bool, len(emails))
+	unique := make([]string, 0, len(emails))
+	for _, e := range emails {
+		lc := strings.ToLower(e)
+		if !seen[lc] {
+			seen[lc] = true
+			unique = append(unique, lc)
+		}
+	}
 
-// listUsers is the shared paginator. When filter is non-empty it is applied as
-// a $filter query parameter and ConsistencyLevel/eventual is set accordingly.
-func (c *client) listUsers(ctx context.Context, pageSize int, filter string) ([]User, error) {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	var users []User
-	q := url.Values{}
-	q.Set("$top", fmt.Sprintf("%d", pageSize))
-	q.Set("$select", "id,displayName,userPrincipalName,mail,accountEnabled")
-	if filter != "" {
+	out := make(map[string]User, len(unique))
+	for i := 0; i < len(unique); i += batchMax {
+		end := i + batchMax
+		if end > len(unique) {
+			end = len(unique)
+		}
+		if err := c.resolveEmailBatch(ctx, token, unique[i:end], out); err != nil {
+			return nil, fmt.Errorf("email lookup batch at index %d: %w", i, err)
+		}
+	}
+	return out, nil
+}
+
+func (c *client) resolveEmailBatch(ctx context.Context, token string, emails []string, out map[string]User) error {
+	items := make([]batchRequest, len(emails))
+	idToEmail := make(map[string]string, len(emails))
+
+	for i, email := range emails {
+		id := fmt.Sprintf("%d", i+1)
+		idToEmail[id] = email
+		// Escape single quotes for OData string literals.
+		escaped := strings.ReplaceAll(email, "'", "''")
+		q := url.Values{}
+		q.Set("$filter", fmt.Sprintf("mail eq '%s' or userPrincipalName eq '%s'", escaped, escaped))
+		q.Set("$select", "id,displayName,userPrincipalName,mail,accountEnabled")
 		q.Set("$count", "true")
-		q.Set("$filter", filter)
+		q.Set("$top", "2") // only need to know: 0, 1, or 2+
+		items[i] = batchRequest{
+			ID:     id,
+			Method: "GET",
+			URL:    "/users?" + q.Encode(),
+			Headers: map[string]string{
+				"ConsistencyLevel": "eventual",
+			},
+		}
 	}
-	nextURL := fmt.Sprintf("%s/users?%s", graphBase, q.Encode())
 
-	for nextURL != "" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("building users request: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		if filter != "" {
-			// ConsistencyLevel + $count required when using $filter with advanced queries.
-			req.Header.Set("ConsistencyLevel", "eventual")
-		}
+	payload, err := json.Marshal(batchEnvelope{Requests: items})
+	if err != nil {
+		return fmt.Errorf("marshalling batch: %w", err)
+	}
 
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("listing users: %w", err)
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, graphBase+"/$batch", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("building batch request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
 
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return nil, fmt.Errorf("list users %d: %s", resp.StatusCode, body)
-		}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("sending batch: %w", err)
+	}
+	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("batch endpoint %d: %s", resp.StatusCode, body)
+	}
+
+	var br batchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&br); err != nil {
+		return fmt.Errorf("decoding batch response: %w", err)
+	}
+
+	for _, r := range br.Responses {
+		email := idToEmail[r.ID]
+		if r.Status != http.StatusOK {
+			slog.Warn("entra email lookup failed", "email", email, "graph_status", r.Status)
+			continue
+		}
 		var page usersPage
-		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("decoding users page: %w", err)
+		if err := json.Unmarshal(r.Body, &page); err != nil {
+			slog.Warn("decoding entra email lookup response", "email", email, "error", err)
+			continue
 		}
-		resp.Body.Close()
-
-		users = append(users, page.Value...)
-		nextURL = page.NextLink
+		switch len(page.Value) {
+		case 0:
+			// not found in Entra — omit silently
+		case 1:
+			out[email] = page.Value[0]
+		default:
+			slog.Warn("ambiguous email — multiple Entra accounts match, skipping",
+				"email", email,
+				"count", len(page.Value),
+			)
+		}
 	}
-
-	return users, nil
+	return nil
 }
 
 // DisableUsers sets accountEnabled=false for each userID using the Graph $batch
