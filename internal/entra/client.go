@@ -214,10 +214,10 @@ func (c *client) resolveEmailBatch(ctx context.Context, token string, emails []s
 }
 
 // DisableUsers sets accountEnabled=false for each userID using the Graph $batch
-// endpoint (max 20 items per call) to stay within API rate limits.
-// Fatal errors (e.g. 401 Unauthorized on the batch endpoint) are returned as the
-// error value. Per-user failures (e.g. 403 for privileged accounts) are recorded
-// in the returned slice so callers can continue processing the remaining users.
+// endpoint (max 20 items per call). Fatal errors (e.g. 401 on the batch
+// endpoint) are returned as the error value. Per-user failures (e.g. 403 for
+// privileged accounts) are recorded in the returned slice so callers can
+// continue processing the remaining accounts.
 func (c *client) DisableUsers(ctx context.Context, userIDs []string) ([]DisableResult, error) {
 	if len(userIDs) == 0 {
 		return nil, nil
@@ -280,8 +280,6 @@ func (c *client) sendDisableBatch(ctx context.Context, token string, userIDs []s
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		// 401 means our credentials are invalid — nothing further will succeed.
-		// Any other HTTP-level failure from the batch endpoint is also fatal.
 		return nil, fmt.Errorf("batch endpoint %d: %s", resp.StatusCode, body)
 	}
 
@@ -297,9 +295,6 @@ func (c *client) sendDisableBatch(ctx context.Context, token string, userIDs []s
 			results = append(results, DisableResult{UserID: uid})
 			continue
 		}
-		// 403 Forbidden: account has elevated privileges the app cannot override.
-		// 404 Not Found: account was removed between the list and disable steps.
-		// Any other unexpected status: record and skip rather than aborting the run.
 		results = append(results, DisableResult{
 			UserID:  uid,
 			Skipped: true,

@@ -17,15 +17,17 @@ type Connector struct {
 	mimecast         mimecast.Client
 	pageSize         int
 	disableThreshold int
+	watchWindowDays  int
 	dryRun           bool
 }
 
-func New(entraClient entra.Client, mimecastClient mimecast.Client, pageSize, disableThreshold int, dryRun bool) *Connector {
+func New(entraClient entra.Client, mimecastClient mimecast.Client, pageSize, disableThreshold, watchWindowDays int, dryRun bool) *Connector {
 	return &Connector{
 		entra:            entraClient,
 		mimecast:         mimecastClient,
 		pageSize:         pageSize,
 		disableThreshold: disableThreshold,
+		watchWindowDays:  watchWindowDays,
 		dryRun:           dryRun,
 	}
 }
@@ -42,7 +44,7 @@ func New(entraClient entra.Client, mimecastClient mimecast.Client, pageSize, dis
 func (c *Connector) Run(ctx context.Context) error {
 	slog.Info("training compliance check started", "dry_run", c.dryRun)
 
-	allRecords, err := c.mimecast.GetAllUserRecords(ctx, c.pageSize, c.disableThreshold)
+	allRecords, err := c.mimecast.GetAllUserRecords(ctx, c.pageSize, c.disableThreshold, c.watchWindowDays)
 	if err != nil {
 		return fmt.Errorf("fetching mimecast user records: %w", err)
 	}
@@ -69,14 +71,28 @@ func (c *Connector) Run(ctx context.Context) error {
 			eu, inEntra := entraUsers[strings.ToLower(r.Email)]
 			entraEnabled := inEntra && eu.AccountEnabled
 			wouldDisable := r.Incomplete && entraEnabled
+
+			// Log the Entra account's own mail and UPN alongside the Mimecast
+			// email so mismatches (wrong account targeted) are immediately visible.
+			var entraMail, entraUPN, entraID string
+			if inEntra {
+				entraMail = eu.Mail
+				entraUPN = eu.UserPrincipalName
+				entraID = eu.ID
+			}
+			emailMatch := !inEntra || strings.EqualFold(r.Email, eu.Mail) || strings.EqualFold(r.Email, eu.UserPrincipalName)
 			slog.Info("dry run — account status",
-				"email", r.Email,
+				"mimecast_email", r.Email,
 				"name", r.Name,
 				"mimecast_user_id", r.UserID,
 				"mimecast_state", r.UserState,
 				"watched", fmt.Sprintf("%d/%d", r.Watched, r.Total),
 				"not_watched", r.NotWatched,
 				"in_entra", inEntra,
+				"entra_id", entraID,
+				"entra_mail", entraMail,
+				"entra_upn", entraUPN,
+				"email_match", emailMatch,
 				"entra_enabled", entraEnabled,
 				"would_disable", wouldDisable,
 			)
@@ -120,10 +136,22 @@ func (c *Connector) Run(ctx context.Context) error {
 			slog.Info("account already disabled in entra — skipping", "email", r.Email, "entra_id", eu.ID)
 			continue
 		}
+		emailMatch := strings.EqualFold(r.Email, eu.Mail) || strings.EqualFold(r.Email, eu.UserPrincipalName)
+		if !emailMatch {
+			slog.Warn("email mismatch — mimecast email does not match entra mail or UPN; skipping to avoid disabling wrong account",
+				"mimecast_email", r.Email,
+				"entra_id", eu.ID,
+				"entra_mail", eu.Mail,
+				"entra_upn", eu.UserPrincipalName,
+			)
+			continue
+		}
 		slog.Info("matched account to disable",
-			"email", r.Email,
+			"mimecast_email", r.Email,
 			"mimecast_user_id", r.UserID,
 			"entra_id", eu.ID,
+			"entra_mail", eu.Mail,
+			"entra_upn", eu.UserPrincipalName,
 		)
 		targets = append(targets, target{id: eu.ID, email: r.Email})
 	}

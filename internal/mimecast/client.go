@@ -25,8 +25,10 @@ const (
 // Client defines the Mimecast Awareness Training operations required by the connector.
 type Client interface {
 	// GetAllUserRecords returns training stats for every active Mimecast user.
-	// Incomplete is set when a user has at least threshold unwatched videos.
-	GetAllUserRecords(ctx context.Context, pageSize, threshold int) ([]UserRecord, error)
+	// Incomplete is set when a user has at least threshold unwatched videos that
+	// were sent more than watchWindowDays ago (matching the Mimecast dashboard
+	// definition of overdue — videos still within the watch window are excluded).
+	GetAllUserRecords(ctx context.Context, pageSize, threshold, watchWindowDays int) ([]UserRecord, error)
 }
 
 type client struct {
@@ -51,10 +53,18 @@ func NewClient(baseURL, clientID, clientSecret string) Client {
 	}
 }
 
+// timeSentLayout is the timestamp format Mimecast uses in userDetails.timeSent.
+const timeSentLayout = "2006-01-02T15:04:05-0700"
+
 // GetAllUserRecords pages through the company performance report and returns
-// training stats for every active user. Incomplete is set when NumNotWatched
-// is at or above threshold.
-func (c *client) GetAllUserRecords(ctx context.Context, pageSize, threshold int) ([]UserRecord, error) {
+// training stats for every active user. Incomplete is set when the number of
+// overdue unwatched videos is at or above threshold. A video is considered
+// overdue when it was sent more than watchWindowDays ago, matching the
+// Mimecast dashboard definition (videos still within the watch window are not
+// yet counted as a problem).
+func (c *client) GetAllUserRecords(ctx context.Context, pageSize, threshold, watchWindowDays int) ([]UserRecord, error) {
+	cutoff := time.Now().UTC().Add(-time.Duration(watchWindowDays) * 24 * time.Hour)
+
 	var out []UserRecord
 	var pageToken string
 
@@ -68,18 +78,27 @@ func (c *client) GetAllUserRecords(ctx context.Context, pageSize, threshold int)
 			if r.Email == "" {
 				continue
 			}
+			notWatched := 0
+			for _, d := range r.UserDetails {
+				if !strings.EqualFold(d.Status, "Not Watched") {
+					continue
+				}
+				sent, err := time.Parse(timeSentLayout, d.TimeSent)
+				if err != nil || sent.Before(cutoff) {
+					notWatched++
+				}
+			}
 			watched := r.NumCorrect + r.NumIncorrect
-			total := watched + r.NumNotWatched
+			total := watched + notWatched
 			out = append(out, UserRecord{
 				UserID:     r.UserID,
 				Email:      r.Email,
 				Name:       r.Name,
 				UserState:  r.UserState,
 				Watched:    watched,
-				NotWatched: r.NumNotWatched,
+				NotWatched: notWatched,
 				Total:      total,
-				// Only active users are candidates for disabling.
-				Incomplete: strings.EqualFold(r.UserState, "active") && r.NumNotWatched >= threshold,
+				Incomplete: strings.EqualFold(r.UserState, "active") && notWatched >= threshold,
 			})
 		}
 

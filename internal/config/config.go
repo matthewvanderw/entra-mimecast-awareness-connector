@@ -24,6 +24,11 @@ type Config struct {
 	// triggers an account disable. Defaults to 4.
 	DisableThreshold int
 
+	// WatchWindowDays is how many days a user has to watch a video before it
+	// counts as overdue. Videos sent within this window are excluded from the
+	// not-watched count to match the Mimecast dashboard behaviour. Defaults to 30.
+	WatchWindowDays int
+
 	// DryRun logs which accounts would be disabled without making any changes.
 	DryRun bool
 }
@@ -38,6 +43,7 @@ func Load() (*Config, error) {
 		MimecastClientSecret: getEnv("MIMECAST_CLIENT_SECRET", ""),
 		PageSize:         50,
 		DisableThreshold: 4,
+		WatchWindowDays:  30,
 		DryRun:           os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1",
 	}
 
@@ -55,6 +61,14 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("DISABLE_THRESHOLD must be a positive integer, got %q", raw)
 		}
 		cfg.DisableThreshold = n
+	}
+
+	if raw := os.Getenv("WATCH_WINDOW_DAYS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("WATCH_WINDOW_DAYS must be a positive integer, got %q", raw)
+		}
+		cfg.WatchWindowDays = n
 	}
 
 	return cfg, cfg.validate()
