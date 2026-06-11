@@ -29,6 +29,10 @@ type Client interface {
 	// logged as ambiguous and omitted.
 	GetUsersByEmail(ctx context.Context, emails []string) (map[string]User, error)
 	DisableUsers(ctx context.Context, userIDs []string) ([]DisableResult, error)
+	// GetRecentlyReEnabledUserIDs returns the set of Entra user IDs whose
+	// accountEnabled was set to true at or after the given cutoff time.
+	// Requires AuditLog.Read.All on the service principal.
+	GetRecentlyReEnabledUserIDs(ctx context.Context, since time.Time) (map[string]bool, error)
 }
 
 type client struct {
@@ -241,6 +245,65 @@ func (c *client) DisableUsers(ctx context.Context, userIDs []string) ([]DisableR
 		all = append(all, results...)
 	}
 	return all, nil
+}
+
+// GetRecentlyReEnabledUserIDs queries the Graph audit log for all "Update user"
+// events since the given cutoff where accountEnabled was changed to true, and
+// returns the set of affected user IDs. Pagination is followed automatically.
+func (c *client) GetRecentlyReEnabledUserIDs(ctx context.Context, since time.Time) (map[string]bool, error) {
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	cutoff := since.UTC().Format(time.RFC3339)
+	q := url.Values{}
+	q.Set("$filter", fmt.Sprintf(
+		"activityDisplayName eq 'Update user' and activityDateTime ge %s", cutoff,
+	))
+	q.Set("$select", "activityDateTime,targetResources")
+
+	out := make(map[string]bool)
+	next := graphBase + "/auditLogs/directoryAudits?" + q.Encode()
+
+	for next != "" {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, next, nil)
+		if err != nil {
+			return nil, fmt.Errorf("building audit log request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("audit log request: %w", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("audit log endpoint %d: %s", resp.StatusCode, body)
+		}
+
+		var page auditLogsPage
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, fmt.Errorf("decoding audit log response: %w", err)
+		}
+
+		for _, entry := range page.Value {
+			for _, target := range entry.TargetResources {
+				for _, prop := range target.ModifiedProperties {
+					if strings.EqualFold(prop.DisplayName, "AccountEnabled") &&
+						strings.Trim(prop.NewValue, `" `) == "true" {
+						out[target.ID] = true
+					}
+				}
+			}
+		}
+
+		next = page.NextLink
+	}
+
+	return out, nil
 }
 
 func (c *client) sendDisableBatch(ctx context.Context, token string, userIDs []string) ([]DisableResult, error) {

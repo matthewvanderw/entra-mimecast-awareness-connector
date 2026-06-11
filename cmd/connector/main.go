@@ -26,7 +26,7 @@ func main() {
 		cfg.MimecastClientID,
 		cfg.MimecastClientSecret,
 	)
-	conn := connector.New(entraClient, mimecastClient, cfg.PageSize, cfg.DisableThreshold, cfg.WatchWindowDays, cfg.DryRun)
+	conn := connector.New(entraClient, mimecastClient, cfg.PageSize, cfg.DisableThreshold, cfg.WatchWindowDays, cfg.ReEnableGraceDays, cfg.DryRun)
 
 	slog.Info("starting compliance run", "dry_run", cfg.DryRun)
 	if err := conn.Run(context.Background()); err != nil {

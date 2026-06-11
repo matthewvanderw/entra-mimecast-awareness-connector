@@ -29,6 +29,11 @@ type Config struct {
 	// not-watched count to match the Mimecast dashboard behaviour. Defaults to 30.
 	WatchWindowDays int
 
+	// ReEnableGraceDays is how many days after an account is manually re-enabled
+	// in Entra before the connector is allowed to disable it again. Accounts
+	// re-enabled within this window are skipped. Defaults to 7.
+	ReEnableGraceDays int
+
 	// DryRun logs which accounts would be disabled without making any changes.
 	DryRun bool
 }
@@ -41,10 +46,11 @@ func Load() (*Config, error) {
 		MimecastBaseURL:      getEnv("MIMECAST_BASE_URL", "https://api.services.mimecast.com"),
 		MimecastClientID:     getEnv("MIMECAST_CLIENT_ID", ""),
 		MimecastClientSecret: getEnv("MIMECAST_CLIENT_SECRET", ""),
-		PageSize:         50,
-		DisableThreshold: 4,
-		WatchWindowDays:  30,
-		DryRun:           os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1",
+		PageSize:          50,
+		DisableThreshold:  4,
+		WatchWindowDays:   30,
+		ReEnableGraceDays: 7,
+		DryRun:            os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1",
 	}
 
 	if raw := os.Getenv("PAGE_SIZE"); raw != "" {
@@ -69,6 +75,14 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("WATCH_WINDOW_DAYS must be a positive integer, got %q", raw)
 		}
 		cfg.WatchWindowDays = n
+	}
+
+	if raw := os.Getenv("RE_ENABLE_GRACE_DAYS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("RE_ENABLE_GRACE_DAYS must be a non-negative integer, got %q", raw)
+		}
+		cfg.ReEnableGraceDays = n
 	}
 
 	return cfg, cfg.validate()

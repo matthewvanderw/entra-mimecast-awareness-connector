@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/matthewvanderw/entra-mimecast-awareness-connector/internal/entra"
 	"github.com/matthewvanderw/entra-mimecast-awareness-connector/internal/mimecast"
@@ -13,22 +14,24 @@ import (
 // Connector orchestrates the training-compliance check between
 // Mimecast Awareness Training and Microsoft Entra ID.
 type Connector struct {
-	entra            entra.Client
-	mimecast         mimecast.Client
-	pageSize         int
-	disableThreshold int
-	watchWindowDays  int
-	dryRun           bool
+	entra              entra.Client
+	mimecast           mimecast.Client
+	pageSize           int
+	disableThreshold   int
+	watchWindowDays    int
+	reEnableGraceDays  int
+	dryRun             bool
 }
 
-func New(entraClient entra.Client, mimecastClient mimecast.Client, pageSize, disableThreshold, watchWindowDays int, dryRun bool) *Connector {
+func New(entraClient entra.Client, mimecastClient mimecast.Client, pageSize, disableThreshold, watchWindowDays, reEnableGraceDays int, dryRun bool) *Connector {
 	return &Connector{
-		entra:            entraClient,
-		mimecast:         mimecastClient,
-		pageSize:         pageSize,
-		disableThreshold: disableThreshold,
-		watchWindowDays:  watchWindowDays,
-		dryRun:           dryRun,
+		entra:             entraClient,
+		mimecast:          mimecastClient,
+		pageSize:          pageSize,
+		disableThreshold:  disableThreshold,
+		watchWindowDays:   watchWindowDays,
+		reEnableGraceDays: reEnableGraceDays,
+		dryRun:            dryRun,
 	}
 }
 
@@ -55,6 +58,16 @@ func (c *Connector) Run(ctx context.Context) error {
 		email string
 	}
 
+	var reEnabledIDs map[string]bool
+	if c.reEnableGraceDays > 0 {
+		since := time.Now().AddDate(0, 0, -c.reEnableGraceDays)
+		reEnabledIDs, err = c.entra.GetRecentlyReEnabledUserIDs(ctx, since)
+		if err != nil {
+			return fmt.Errorf("fetching re-enabled audit log: %w", err)
+		}
+		slog.Info("fetched recently re-enabled accounts", "count", len(reEnabledIDs), "grace_days", c.reEnableGraceDays)
+	}
+
 	if c.dryRun {
 		emails := emailList(allRecords)
 		entraUsers, err := c.entra.GetUsersByEmail(ctx, emails)
@@ -70,7 +83,8 @@ func (c *Connector) Run(ctx context.Context) error {
 		for _, r := range allRecords {
 			eu, inEntra := entraUsers[strings.ToLower(r.Email)]
 			entraEnabled := inEntra && eu.AccountEnabled
-			wouldDisable := r.Incomplete && entraEnabled
+			inGrace := inEntra && reEnabledIDs[eu.ID]
+			wouldDisable := r.Incomplete && entraEnabled && !inGrace
 
 			// Log the Entra account's own mail and UPN alongside the Mimecast
 			// email so mismatches (wrong account targeted) are immediately visible.
@@ -94,6 +108,7 @@ func (c *Connector) Run(ctx context.Context) error {
 				"entra_upn", entraUPN,
 				"email_match", emailMatch,
 				"entra_enabled", entraEnabled,
+				"in_re_enable_grace", inGrace,
 				"would_disable", wouldDisable,
 			)
 			if wouldDisable {
@@ -134,6 +149,14 @@ func (c *Connector) Run(ctx context.Context) error {
 		}
 		if !eu.AccountEnabled {
 			slog.Info("account already disabled in entra — skipping", "email", r.Email, "entra_id", eu.ID)
+			continue
+		}
+		if reEnabledIDs[eu.ID] {
+			slog.Info("account re-enabled within grace period — skipping",
+				"email", r.Email,
+				"entra_id", eu.ID,
+				"grace_days", c.reEnableGraceDays,
+			)
 			continue
 		}
 		emailMatch := strings.EqualFold(r.Email, eu.Mail) || strings.EqualFold(r.Email, eu.UserPrincipalName)

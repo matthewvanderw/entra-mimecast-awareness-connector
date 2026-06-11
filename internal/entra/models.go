@@ -1,6 +1,9 @@
 package entra
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // DisableResult is the outcome of one account-disable attempt.
 type DisableResult struct {
@@ -49,4 +52,26 @@ type batchResponseItem struct {
 	ID     string          `json:"id"`
 	Status int             `json:"status"`
 	Body   json.RawMessage `json:"body,omitempty"`
+}
+
+// Audit log models for querying directoryAudits.
+
+type auditLogsPage struct {
+	Value    []auditLogEntry `json:"value"`
+	NextLink string          `json:"@odata.nextLink"`
+}
+
+type auditLogEntry struct {
+	ActivityDateTime time.Time         `json:"activityDateTime"`
+	TargetResources  []auditTarget     `json:"targetResources"`
+}
+
+type auditTarget struct {
+	ID                 string                 `json:"id"`
+	ModifiedProperties []auditModifiedProperty `json:"modifiedProperties"`
+}
+
+type auditModifiedProperty struct {
+	DisplayName string `json:"displayName"`
+	NewValue    string `json:"newValue"`
 }
